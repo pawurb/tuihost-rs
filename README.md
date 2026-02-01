@@ -75,6 +75,62 @@ tuihost -l 0.0.0.0:22 -k /etc/tuihost/host_key -c myapp --max-connections 200 --
 - Session timeouts
 - Auth rejection delay (slows brute force)
 
+### Running as a dedicated user
+
+Spawned commands inherit the same user permissions as the tuihost process. **Never run tuihost as root** - if your TUI application has a vulnerability, attackers could gain full system access.
+
+Create a restricted system user:
+
+```bash
+# Create system user with no home directory and no login shell
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin tuihost
+
+# Create directory for host key
+sudo mkdir -p /etc/tuihost
+sudo chown tuihost:tuihost /etc/tuihost
+sudo chmod 700 /etc/tuihost
+```
+
+Example systemd service with sandboxing (`/etc/systemd/system/tuihost.service`):
+
+```ini
+[Unit]
+Description=tuihost SSH TUI server
+After=network.target
+
+[Service]
+Type=simple
+User=tuihost
+Group=tuihost
+ExecStart=/usr/local/bin/tuihost -l 0.0.0.0:2222 -k /etc/tuihost/host_key -c /usr/bin/htop
+
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+# Allow binding to privileged port 22 if needed
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now tuihost
+```
+
 ### iptables rate limiting
 
 ```bash
