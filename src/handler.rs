@@ -1,7 +1,7 @@
 use crate::pty::{PtySession, PtyWriter};
 use crate::server::CmdConfig;
 use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec};
+use russh::{Channel, ChannelId, CryptoVec, Disconnect};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,6 +19,7 @@ pub struct SessionHandler {
     pty_writers: Arc<Mutex<HashMap<ChannelId, Arc<Mutex<PtyWriter>>>>>,
     client_addr: String,
     active_connections: Arc<AtomicUsize>,
+    shell_requested: bool,
 }
 
 impl SessionHandler {
@@ -33,6 +34,7 @@ impl SessionHandler {
             pty_writers: Arc::new(Mutex::new(HashMap::new())),
             client_addr,
             active_connections,
+            shell_requested: false,
         }
     }
 
@@ -41,6 +43,7 @@ impl SessionHandler {
         let rows = (rows as u16).clamp(MIN_PTY_ROWS, MAX_PTY_ROWS);
         (cols, rows)
     }
+
 }
 
 impl Drop for SessionHandler {
@@ -124,6 +127,16 @@ impl Handler for SessionHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self.shell_requested {
+            error!(
+                "SECURITY: duplicate shell request from {} - disconnecting",
+                self.client_addr
+            );
+            session.disconnect(Disconnect::ByApplication, "duplicate shell request", "en")?;
+            return Ok(());
+        }
+        self.shell_requested = true;
+
         info!(
             "Shell request for channel {:?} from {}",
             channel, self.client_addr
@@ -247,5 +260,214 @@ impl Handler for SessionHandler {
     ) -> Result<(), Self::Error> {
         debug!("Channel EOF: {:?} from {}", channel, self.client_addr);
         Ok(())
+    }
+
+    // =========================================================================
+    // SECURITY: Whitelist-based request handling
+    //
+    // ALLOWED (implemented above):
+    //   - pty_request: Terminal allocation
+    //   - shell_request: Spawn TUI (once per session)
+    //   - window_change_request: Terminal resize
+    //   - channel_open_session: Session channel
+    //   - data: stdin to PTY
+    //   - channel_close, channel_eof: Cleanup
+    //
+    // EXPLICITLY REJECTED (below):
+    //   Everything else is explicitly rejected with logging.
+    //   This ensures new russh features don't accidentally get allowed.
+    // =========================================================================
+
+    async fn exec_request(
+        &mut self,
+        _channel: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let cmd = String::from_utf8_lossy(data);
+        error!(
+            "SECURITY: exec request from {}: {:?} - disconnecting client",
+            self.client_addr,
+            cmd.chars().take(100).collect::<String>()
+        );
+        // Disconnect the client immediately
+        session.disconnect(Disconnect::ByApplication, "exec not permitted", "en")?;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        _channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        error!(
+            "SECURITY: subsystem request '{}' from {} - disconnecting",
+            name, self.client_addr
+        );
+        session.disconnect(Disconnect::ByApplication, "subsystem not permitted", "en")?;
+        Ok(())
+    }
+
+    async fn env_request(
+        &mut self,
+        _channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Env requests are commonly sent by SSH clients (TERM, LANG, etc.)
+        // Just ignore them - don't even send failure response as it can cause issues
+        debug!(
+            "Ignoring env request {}={} from {}",
+            variable_name,
+            variable_value.chars().take(50).collect::<String>(),
+            self.client_addr
+        );
+        // Note: Not sending channel_failure - just silently ignore
+        Ok(())
+    }
+
+    async fn x11_request(
+        &mut self,
+        _channel: ChannelId,
+        _single_connection: bool,
+        _x11_auth_protocol: &str,
+        _x11_auth_cookie: &str,
+        _x11_screen_number: u32,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // X11 forwarding often enabled by default in client configs - just ignore
+        debug!("Ignoring X11 forwarding request from {}", self.client_addr);
+        Ok(())
+    }
+
+    async fn signal(
+        &mut self,
+        _channel: ChannelId,
+        signal: russh::Sig,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Signals can be legitimate (e.g., window resize sends SIGWINCH)
+        debug!("Ignoring signal {:?} from {}", signal, self.client_addr);
+        Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Port forwarding might be in client config - just deny, don't disconnect
+        debug!(
+            "Denying tcpip-forward request to {}:{} from {}",
+            address, port, self.client_addr
+        );
+        Ok(false)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        debug!(
+            "Denying cancel-tcpip-forward request for {}:{} from {}",
+            address, port, self.client_addr
+        );
+        Ok(false)
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Active port forwarding attempt - deny but don't disconnect
+        warn!(
+            "Denying direct-tcpip channel from {} to {}:{} (originator {}:{})",
+            self.client_addr,
+            host_to_connect,
+            port_to_connect,
+            originator_address,
+            originator_port
+        );
+        drop(channel);
+        Ok(false)
+    }
+
+    async fn channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        originator_address: &str,
+        originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        warn!(
+            "Denying forwarded-tcpip channel from {} to {}:{} (originator {}:{})",
+            self.client_addr,
+            host_to_connect,
+            port_to_connect,
+            originator_address,
+            originator_port
+        );
+        drop(channel);
+        Ok(false)
+    }
+
+    async fn channel_open_direct_streamlocal(
+        &mut self,
+        channel: Channel<Msg>,
+        socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        warn!(
+            "Denying direct-streamlocal channel from {} to socket {}",
+            self.client_addr, socket_path
+        );
+        drop(channel);
+        Ok(false)
+    }
+
+    async fn streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        debug!(
+            "Denying streamlocal-forward request for {} from {}",
+            socket_path, self.client_addr
+        );
+        Ok(false)
+    }
+
+    async fn cancel_streamlocal_forward(
+        &mut self,
+        socket_path: &str,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        debug!(
+            "Denying cancel-streamlocal-forward for {} from {}",
+            socket_path, self.client_addr
+        );
+        Ok(false)
+    }
+
+    async fn agent_request(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Agent forwarding often enabled by default - just deny, don't disconnect
+        debug!("Denying agent forwarding request from {}", self.client_addr);
+        Ok(false)
     }
 }

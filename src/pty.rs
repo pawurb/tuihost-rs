@@ -23,6 +23,8 @@ impl PtySession {
         let child = pty_process::Command::new(command)
             .args(args)
             .env_clear()
+            .env("TERM", "xterm-256color")
+            .env("LANG", "en_US.UTF-8")
             .envs(env.iter().cloned())
             .spawn(pts)
             .with_context(|| format!("Failed to spawn command: {}", command))?;

@@ -1,4 +1,5 @@
-# tuihost 
+# tuihost
+[![Latest Version](https://img.shields.io/crates/v/tuihost.svg)](https://crates.io/crates/tuihost)
 
 > ⚠️ Disclaimer  
 > Mostly one-shotted with Claude Code. Not audited. You've been warned. 
