@@ -5,6 +5,7 @@ use russh::{Channel, ChannelId, CryptoVec, Disconnect};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +21,7 @@ pub struct SessionHandler {
     client_addr: String,
     active_connections: Arc<AtomicUsize>,
     shell_requested: bool,
+    max_session_duration: Option<Duration>,
 }
 
 impl SessionHandler {
@@ -27,6 +29,7 @@ impl SessionHandler {
         tui_config: Arc<CmdConfig>,
         client_addr: String,
         active_connections: Arc<AtomicUsize>,
+        max_session_duration: Option<Duration>,
     ) -> Self {
         Self {
             tui_config,
@@ -35,6 +38,7 @@ impl SessionHandler {
             client_addr,
             active_connections,
             shell_requested: false,
+            max_session_duration,
         }
     }
 
@@ -43,7 +47,6 @@ impl SessionHandler {
         let rows = (rows as u16).clamp(MIN_PTY_ROWS, MAX_PTY_ROWS);
         (cols, rows)
     }
-
 }
 
 impl Drop for SessionHandler {
@@ -170,34 +173,62 @@ impl Handler for SessionHandler {
 
         let handle = session.handle();
         let client_addr = self.client_addr.clone();
+        let max_session_duration = self.max_session_duration;
 
         tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                match pty_reader.read(&mut buf).await {
-                    Ok(0) => {
-                        debug!("PTY closed (EOF) for {}", client_addr);
-                        let _ = handle.close(channel).await;
-                        break;
-                    }
-                    Ok(n) => {
-                        let data = CryptoVec::from_slice(&buf[..n]);
-                        if handle.data(channel, data).await.is_err() {
-                            debug!(
-                                "Failed to send data to channel for {}, closing",
-                                client_addr
-                            );
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        if e.kind() != std::io::ErrorKind::WouldBlock {
-                            debug!("PTY read error for {}: {}", client_addr, e);
+            let read_loop = async {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match pty_reader.read(&mut buf).await {
+                        Ok(0) => {
+                            debug!("PTY closed (EOF) for {}", client_addr);
                             let _ = handle.close(channel).await;
                             break;
                         }
+                        Ok(n) => {
+                            let data = CryptoVec::from_slice(&buf[..n]);
+                            if handle.data(channel, data).await.is_err() {
+                                debug!(
+                                    "Failed to send data to channel for {}, closing",
+                                    client_addr
+                                );
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if e.kind() != std::io::ErrorKind::WouldBlock {
+                                debug!("PTY read error for {}: {}", client_addr, e);
+                                let _ = handle.close(channel).await;
+                                break;
+                            }
+                        }
                     }
                 }
+            };
+
+            if let Some(duration) = max_session_duration {
+                if tokio::time::timeout(duration, read_loop).await.is_err() {
+                    info!(
+                        "Max session duration ({:?}) exceeded for {} - disconnecting",
+                        duration, client_addr
+                    );
+                    let msg = format!(
+                        "\r\nSession terminated: max session duration ({}s) exceeded.\r\n",
+                        duration.as_secs()
+                    );
+                    let _ = handle
+                        .data(channel, CryptoVec::from_slice(msg.as_bytes()))
+                        .await;
+                    let _ = handle
+                        .disconnect(
+                            Disconnect::ByApplication,
+                            "max session duration exceeded".to_string(),
+                            "en".to_string(),
+                        )
+                        .await;
+                }
+            } else {
+                read_loop.await;
             }
         });
 
@@ -392,11 +423,7 @@ impl Handler for SessionHandler {
         // Active port forwarding attempt - deny but don't disconnect
         warn!(
             "Denying direct-tcpip channel from {} to {}:{} (originator {}:{})",
-            self.client_addr,
-            host_to_connect,
-            port_to_connect,
-            originator_address,
-            originator_port
+            self.client_addr, host_to_connect, port_to_connect, originator_address, originator_port
         );
         drop(channel);
         Ok(false)
@@ -413,11 +440,7 @@ impl Handler for SessionHandler {
     ) -> Result<bool, Self::Error> {
         warn!(
             "Denying forwarded-tcpip channel from {} to {}:{} (originator {}:{})",
-            self.client_addr,
-            host_to_connect,
-            port_to_connect,
-            originator_address,
-            originator_port
+            self.client_addr, host_to_connect, port_to_connect, originator_address, originator_port
         );
         drop(channel);
         Ok(false)

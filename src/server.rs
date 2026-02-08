@@ -17,14 +17,20 @@ pub struct TuiSshServer {
     tui_config: Arc<CmdConfig>,
     max_connections: usize,
     active_connections: Arc<AtomicUsize>,
+    max_session_duration: Option<Duration>,
 }
 
 impl TuiSshServer {
-    pub fn new(tui_config: CmdConfig, max_connections: usize) -> Self {
+    pub fn new(
+        tui_config: CmdConfig,
+        max_connections: usize,
+        max_session_duration: Option<Duration>,
+    ) -> Self {
         Self {
             tui_config: Arc::new(tui_config),
             max_connections,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            max_session_duration,
         }
     }
 }
@@ -55,6 +61,7 @@ impl Server for TuiSshServer {
             self.tui_config.clone(),
             addr_str,
             self.active_connections.clone(),
+            self.max_session_duration,
         )
     }
 }

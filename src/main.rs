@@ -46,6 +46,10 @@ struct Args {
     /// Session timeout in seconds (0 = no timeout)
     #[arg(long, default_value = "300")]
     timeout: u64,
+
+    /// Max session duration in seconds (0 = unlimited)
+    #[arg(long, default_value = "0")]
+    max_session_duration: u64,
 }
 
 #[tokio::main]
@@ -85,7 +89,13 @@ async fn main() -> Result<()> {
     };
 
     let ssh_config = create_config(host_key, args.timeout);
-    let mut server = TuiSshServer::new(tui_config, args.max_connections);
+    let max_session_duration = if args.max_session_duration > 0 {
+        Some(std::time::Duration::from_secs(args.max_session_duration))
+    } else {
+        None
+    };
+
+    let mut server = TuiSshServer::new(tui_config, args.max_connections, max_session_duration);
 
     let listener = TcpListener::bind(&args.listen)
         .await
