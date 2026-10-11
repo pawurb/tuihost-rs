@@ -83,5 +83,5 @@ pub fn create_config(host_key: PrivateKey, timeout_secs: u64) -> Config {
 }
 
 pub fn generate_host_key() -> PrivateKey {
-    PrivateKey::random(&mut rand_core::OsRng, Algorithm::Ed25519).expect("Failed to generate key")
+    PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("Failed to generate key")
 }

@@ -128,7 +128,7 @@ fn load_or_generate_host_key(path: &str) -> Result<PrivateKey> {
         let key = generate_host_key();
 
         let openssh_key = key
-            .to_openssh(ssh_key::LineEnding::LF)
+            .to_openssh(russh::keys::ssh_key::LineEnding::LF)
             .map_err(|e| anyhow::anyhow!("Failed to encode key: {}", e))?;
         std::fs::write(key_path, openssh_key.as_bytes())
             .context("Failed to write host key file")?;

@@ -1,7 +1,7 @@
 use crate::pty::{PtySession, PtyWriter};
 use crate::server::CmdConfig;
-use russh::server::{Auth, Handler, Msg, Session};
-use russh::{Channel, ChannelId, CryptoVec, Disconnect};
+use russh::server::{Auth, ChannelOpenHandle, Handler, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,14 +94,16 @@ impl Handler for SessionHandler {
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         debug!(
             "Channel open session: {:?} from {}",
             channel.id(),
             self.client_addr
         );
-        Ok(true)
+        reply.accept().await;
+        Ok(())
     }
 
     async fn pty_request(
@@ -186,8 +188,7 @@ impl Handler for SessionHandler {
                             break;
                         }
                         Ok(n) => {
-                            let data = CryptoVec::from_slice(&buf[..n]);
-                            if handle.data(channel, data).await.is_err() {
+                            if handle.data(channel, buf[..n].to_vec()).await.is_err() {
                                 debug!(
                                     "Failed to send data to channel for {}, closing",
                                     client_addr
@@ -216,9 +217,7 @@ impl Handler for SessionHandler {
                         "\r\nSession terminated: max session duration ({}s) exceeded.\r\n",
                         duration.as_secs()
                     );
-                    let _ = handle
-                        .data(channel, CryptoVec::from_slice(msg.as_bytes()))
-                        .await;
+                    let _ = handle.data(channel, msg).await;
                     let _ = handle
                         .disconnect(
                             Disconnect::ByApplication,
@@ -418,15 +417,19 @@ impl Handler for SessionHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         // Active port forwarding attempt - deny but don't disconnect
         warn!(
             "Denying direct-tcpip channel from {} to {}:{} (originator {}:{})",
             self.client_addr, host_to_connect, port_to_connect, originator_address, originator_port
         );
         drop(channel);
-        Ok(false)
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 
     async fn channel_open_forwarded_tcpip(
@@ -436,28 +439,36 @@ impl Handler for SessionHandler {
         port_to_connect: u32,
         originator_address: &str,
         originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         warn!(
             "Denying forwarded-tcpip channel from {} to {}:{} (originator {}:{})",
             self.client_addr, host_to_connect, port_to_connect, originator_address, originator_port
         );
         drop(channel);
-        Ok(false)
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 
     async fn channel_open_direct_streamlocal(
         &mut self,
         channel: Channel<Msg>,
         socket_path: &str,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
+    ) -> Result<(), Self::Error> {
         warn!(
             "Denying direct-streamlocal channel from {} to socket {}",
             self.client_addr, socket_path
         );
         drop(channel);
-        Ok(false)
+        reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        Ok(())
     }
 
     async fn streamlocal_forward(

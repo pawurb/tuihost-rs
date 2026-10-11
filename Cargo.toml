@@ -1,6 +1,6 @@
 [package]
 name = "tuihost"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 readme = "./README.md"
 repository = "https://github.com/pawurb/tuihost"
@@ -10,11 +10,10 @@ categories = ["development-tools"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-russh = "0.57"
+russh = "0.64"
 pty-process = { version = "0.5", features = ["async"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rand_core = "0.6"
-ssh-key = "0.6"
+rand = "0.10"
