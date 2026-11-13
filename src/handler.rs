@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::AbortHandle;
 use tracing::{debug, error, info, warn};
 
 const MIN_PTY_COLS: u16 = 10;
@@ -20,6 +21,11 @@ pub struct SessionHandler {
     pty_writers: Arc<Mutex<HashMap<ChannelId, Arc<Mutex<PtyWriter>>>>>,
     client_addr: String,
     active_connections: Arc<AtomicUsize>,
+    session_limit: Option<Arc<Semaphore>>,
+    /// The PTY relay task of this connection's shell. Aborted when the channel
+    /// or connection closes, so a vanished client releases its session slot
+    /// immediately instead of when the command next writes output.
+    session_task: Option<AbortHandle>,
     shell_requested: bool,
     max_session_duration: Option<Duration>,
 }
@@ -29,6 +35,7 @@ impl SessionHandler {
         tui_config: Arc<CmdConfig>,
         client_addr: String,
         active_connections: Arc<AtomicUsize>,
+        session_limit: Option<Arc<Semaphore>>,
         max_session_duration: Option<Duration>,
     ) -> Self {
         Self {
@@ -37,6 +44,8 @@ impl SessionHandler {
             pty_writers: Arc::new(Mutex::new(HashMap::new())),
             client_addr,
             active_connections,
+            session_limit,
+            session_task: None,
             shell_requested: false,
             max_session_duration,
         }
@@ -51,6 +60,9 @@ impl SessionHandler {
 
 impl Drop for SessionHandler {
     fn drop(&mut self) {
+        if let Some(task) = self.session_task.take() {
+            task.abort();
+        }
         let prev = self.active_connections.fetch_sub(1, Ordering::SeqCst);
         debug!(
             "Connection closed from {} ({} remaining)",
@@ -147,6 +159,26 @@ impl Handler for SessionHandler {
             channel, self.client_addr
         );
 
+        // Reserve a session slot before spawning. The permit moves into the
+        // session task below and is released when that task ends, on every
+        // exit path, so the count cannot drift.
+        let permit = match &self.session_limit {
+            Some(limit) => match limit.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    warn!("Session limit reached, rejecting {}", self.client_addr);
+                    // The disconnect reason is what the ssh client prints.
+                    session.disconnect(
+                        Disconnect::ByApplication,
+                        "server busy, try again later",
+                        "en",
+                    )?;
+                    return Ok(());
+                }
+            },
+            None => None,
+        };
+
         let (cols, rows) = self.pty_size;
         let pty = match PtySession::spawn(
             &self.tui_config.command,
@@ -165,7 +197,7 @@ impl Handler for SessionHandler {
 
         session.channel_success(channel)?;
 
-        let (mut pty_reader, pty_writer) = pty.split();
+        let (mut pty_reader, pty_writer, child) = pty.split();
         let pty_writer = Arc::new(Mutex::new(pty_writer));
 
         self.pty_writers
@@ -177,7 +209,12 @@ impl Handler for SessionHandler {
         let client_addr = self.client_addr.clone();
         let max_session_duration = self.max_session_duration;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            // Owned for the lifetime of this task. Locals drop in reverse order,
+            // so when the task ends (or is aborted) the child is killed
+            // (kill_on_drop) first and only then is the session slot released.
+            let _permit = permit;
+            let _child = child;
             let read_loop = async {
                 let mut buf = [0u8; 4096];
                 loop {
@@ -230,6 +267,7 @@ impl Handler for SessionHandler {
                 read_loop.await;
             }
         });
+        self.session_task = Some(task.abort_handle());
 
         Ok(())
     }
@@ -280,6 +318,9 @@ impl Handler for SessionHandler {
     ) -> Result<(), Self::Error> {
         debug!("Channel close: {:?} from {}", channel, self.client_addr);
         self.pty_writers.lock().await.remove(&channel);
+        if let Some(task) = self.session_task.take() {
+            task.abort();
+        }
         Ok(())
     }
 

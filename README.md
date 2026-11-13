@@ -15,7 +15,7 @@ It enables ssh login via just `ssh your-host.com` instead of `ssh demo@your-host
 - Bidirectional I/O between SSH channel and PTY
 - Terminal resize support
 - Auto-generates Ed25519 host key if not present
-- Connection limits and timeouts
+- Concurrent session limits and timeouts
 
 ## Installation
 
@@ -44,7 +44,7 @@ tuihost -c top --max-connections 50 --timeout 600
 -c, --command <CMD>          Command to execute for each connection
 -a, --args <ARGS>...         Arguments to pass to the command
 -e, --env <KEY=VALUE>        Environment variables to pass (clean env by default)
-    --max-connections <N>    Max concurrent connections [default: 100]
+    --max-connections <N>    Max concurrently running sessions, 0 = unlimited [default: 100]
     --timeout <SECS>         Session timeout in seconds [default: 300]
 ```
 
@@ -71,7 +71,7 @@ tuihost -l 0.0.0.0:22 -k /etc/tuihost/host_key -c myapp --max-connections 200 --
 
 ### Built-in protections
 - PTY size validation (prevents resource exhaustion)
-- Connection limits
+- Concurrent session limit: each running command holds a slot until it exits or its client disconnects; extra clients get "server busy" instead of a new process
 - Session timeouts
 - Auth rejection delay (slows brute force)
 

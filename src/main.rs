@@ -39,7 +39,8 @@ struct Args {
     #[arg(short, long, value_name = "KEY=VALUE")]
     env: Vec<String>,
 
-    /// Maximum concurrent connections (0 = unlimited)
+    /// Maximum concurrently running command sessions (0 = unlimited).
+    /// Extra clients are told the server is busy and disconnected.
     #[arg(long, default_value = "100")]
     max_connections: usize,
 

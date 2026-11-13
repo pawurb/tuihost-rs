@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub struct PtySession {
     pty: pty_process::Pty,
-    _child: tokio::process::Child,
+    child: tokio::process::Child,
 }
 
 impl PtySession {
@@ -26,15 +26,18 @@ impl PtySession {
             .env("TERM", "xterm-256color")
             .env("LANG", "en_US.UTF-8")
             .envs(env.iter().cloned())
+            // Whoever holds the child owns the process: dropping it (session
+            // end, timeout, panic) kills the command instead of leaking it.
+            .kill_on_drop(true)
             .spawn(pts)
             .with_context(|| format!("Failed to spawn command: {}", command))?;
 
-        Ok(Self { pty, _child: child })
+        Ok(Self { pty, child })
     }
 
-    pub fn split(self) -> (PtyReader, PtyWriter) {
+    pub fn split(self) -> (PtyReader, PtyWriter, tokio::process::Child) {
         let (reader, writer) = self.pty.into_split();
-        (PtyReader { reader }, PtyWriter { writer })
+        (PtyReader { reader }, PtyWriter { writer }, self.child)
     }
 }
 

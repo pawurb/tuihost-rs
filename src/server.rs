@@ -4,7 +4,8 @@ use russh::server::{Config, Server};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tracing::{info, warn};
+use tokio::sync::Semaphore;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct CmdConfig {
@@ -15,7 +16,12 @@ pub struct CmdConfig {
 
 pub struct TuiSshServer {
     tui_config: Arc<CmdConfig>,
-    max_connections: usize,
+    /// Caps concurrently running commands (`None` = unlimited). A permit is
+    /// taken right before a command is spawned and released when its session
+    /// task ends, so idle or never-authenticated connections don't hold slots.
+    session_limit: Option<Arc<Semaphore>>,
+    /// Open TCP connections, for logging only. Incremented in `new_client`,
+    /// decremented once in `SessionHandler::drop`.
     active_connections: Arc<AtomicUsize>,
     max_session_duration: Option<Duration>,
 }
@@ -23,12 +29,12 @@ pub struct TuiSshServer {
 impl TuiSshServer {
     pub fn new(
         tui_config: CmdConfig,
-        max_connections: usize,
+        max_sessions: usize,
         max_session_duration: Option<Duration>,
     ) -> Self {
         Self {
             tui_config: Arc::new(tui_config),
-            max_connections,
+            session_limit: (max_sessions > 0).then(|| Arc::new(Semaphore::new(max_sessions))),
             active_connections: Arc::new(AtomicUsize::new(0)),
             max_session_duration,
         }
@@ -44,23 +50,13 @@ impl Server for TuiSshServer {
             .unwrap_or_else(|| "unknown".to_string());
 
         let current = self.active_connections.fetch_add(1, Ordering::SeqCst);
-
-        if self.max_connections > 0 && current >= self.max_connections {
-            warn!(
-                "Connection limit reached ({}/{}), rejecting {}",
-                current, self.max_connections, addr_str
-            );
-            self.active_connections.fetch_sub(1, Ordering::SeqCst);
-            // Return handler that will reject - russh doesn't have a direct reject mechanism
-            // The handler will still be created but connection limits are enforced at TCP level ideally
-        }
-
         info!("New connection from {} ({} active)", addr_str, current + 1);
 
         SessionHandler::new(
             self.tui_config.clone(),
             addr_str,
             self.active_connections.clone(),
+            self.session_limit.clone(),
             self.max_session_duration,
         )
     }
